@@ -1,0 +1,58 @@
+---
+# Ansible Playbook to Deploy GitLab CE
+# This playbook installs and configures GitLab Community Edition
+
+- name: Deploy GitLab Community Edition
+  hosts: gitlab_server
+  become: yes
+  gather_facts: yes
+
+  vars:
+    gitlab_external_url: "http://{{ ansible_host }}"
+    gitlab_edition: "gitlab-ce"
+    gitlab_root_password: "{{ lookup('env', 'GITLAB_ROOT_PASSWORD') | default('P@ssw0rd123!', true) }}"
+
+  pre_tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+    - name: Install required packages
+      apt:
+        name:
+          - curl
+          - openssh-server
+          - ca-certificates
+          - tzdata
+          - perl
+          - postfix
+        state: present
+      when: ansible_os_family == "Debian"
+
+  roles:
+    - gitlab
+
+  post_tasks:
+    - name: Wait for GitLab to be ready
+      uri:
+        url: "{{ gitlab_external_url }}"
+        status_code: 200
+        validate_certs: no
+      register: result
+      until: result.status == 200
+      retries: 30
+      delay: 10
+      ignore_errors: yes
+
+    - name: Display GitLab access information
+      debug:
+        msg:
+          - "GitLab is now accessible at: {{ gitlab_external_url }}"
+          - "Root password: {{ gitlab_root_password }}"
+          - "Please change the root password after first login!"
+
+  handlers:
+    - name: restart gitlab
+      command: gitlab-ctl restart

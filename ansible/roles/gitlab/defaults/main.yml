@@ -1,0 +1,28 @@
+---
+# GitLab Role - Default Variables
+
+gitlab_external_url: "http://localhost"
+gitlab_edition: "gitlab-ce"
+gitlab_root_password: "ChangeMe123!"
+gitlab_version: "latest"
+
+# Email configuration
+gitlab_email_enabled: true
+gitlab_email_from: "gitlab@localhost"
+
+# Backup configuration
+gitlab_backup_keep_time: 604800  # 7 days in seconds
+
+# Performance tuning
+gitlab_puma_worker_processes: 2
+gitlab_puma_worker_timeout: 60
+gitlab_postgresql_shared_buffers: "256MB"
+
+# Features
+gitlab_registry_enabled: false
+gitlab_packages_enabled: true
+gitlab_letsencrypt_enabled: false
+
+# Security
+gitlab_ssh_port: 22
+gitlab_https_enabled: false

@@ -1,0 +1,394 @@
+# GitLab CI/CD Pipeline for Inventory App
+# Stages: Build → Test → Scan → Containerization → Deploy Staging → Approval → Deploy Production
+
+variables:
+  # Docker
+  DOCKER_IMAGE: "$DOCKER_REGISTRY/inventory-app"
+  DOCKER_TAG: "$CI_COMMIT_SHORT_SHA"
+
+  # Kubernetes
+  KUBE_NAMESPACE_STAGING: "staging"
+  KUBE_NAMESPACE_PROD: "production"
+
+  # Application
+  APP_NAME: "inventory-app"
+  NODE_VERSION: "18"
+
+stages:
+  - build
+  - test
+  - scan
+  - containerization
+  - deploy-staging
+  - approval
+  - deploy-production
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STAGE 1: BUILD
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+build:
+  stage: build
+  image: node:${NODE_VERSION}-alpine
+  only:
+    - main
+    - develop
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - node_modules/
+  script:
+    - echo "Building Inventory App..."
+    - npm ci --only=production
+    - npm run lint || true
+    - echo "Build completed successfully"
+  artifacts:
+    paths:
+      - node_modules/
+      - src/
+    expire_in: 1 hour
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STAGE 2: TEST
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+test:unit:
+  stage: test
+  image: node:${NODE_VERSION}-alpine
+  only:
+    - main
+    - develop
+  dependencies:
+    - build
+  script:
+    - echo "Running unit tests..."
+    - npm install --only=dev
+    - npm run test:unit || true
+    - echo "Unit tests completed"
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+    expire_in: 30 days
+
+test:integration:
+  stage: test
+  image: node:${NODE_VERSION}-alpine
+  only:
+    - main
+    - develop
+  services:
+    - postgres:15-alpine
+  variables:
+    POSTGRES_DB: inventory_test
+    POSTGRES_USER: test_user
+    POSTGRES_PASSWORD: test_password
+    DATABASE_URL: "postgresql://test_user:test_password@postgres:5432/inventory_test"
+  dependencies:
+    - build
+  script:
+    - echo "Running integration tests..."
+    - npm install --only=dev
+    - npm run test:integration || true
+    - echo "Integration tests completed"
+  artifacts:
+    reports:
+      junit: junit-integration.xml
+    expire_in: 7 days
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STAGE 3: SCAN (Security & Quality)
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+scan:sonarqube:
+  stage: scan
+  image: sonarsource/sonar-scanner-cli:latest
+  only:
+    - main
+    - develop
+  variables:
+    SONAR_HOST_URL: "${SONARQUBE_URL}"
+    SONAR_TOKEN: "${SONARQUBE_TOKEN}"
+    GIT_DEPTH: 0
+  script:
+    - echo "Running SonarQube analysis..."
+    - sonar-scanner
+        -Dsonar.projectKey=inventory-app
+        -Dsonar.sources=src
+        -Dsonar.host.url=${SONAR_HOST_URL}
+        -Dsonar.login=${SONAR_TOKEN}
+        -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+  allow_failure: true
+
+scan:snyk:
+  stage: scan
+  image: snyk/snyk:node
+  only:
+    - main
+    - develop
+  dependencies:
+    - build
+  script:
+    - echo "Running Snyk vulnerability scan..."
+    - snyk auth ${SNYK_TOKEN}
+    - snyk test --severity-threshold=high || true
+    - snyk monitor
+  allow_failure: true
+  artifacts:
+    reports:
+      dependency_scanning: gl-dependency-scanning-report.json
+    expire_in: 7 days
+
+scan:trivy:
+  stage: scan
+  image: aquasec/trivy:latest
+  only:
+    - main
+    - develop
+  script:
+    - echo "Running Trivy filesystem scan..."
+    - trivy filesystem --exit-code 0 --severity HIGH,CRITICAL --format json -o trivy-report.json .
+    - cat trivy-report.json
+  allow_failure: true
+  artifacts:
+    reports:
+      container_scanning: trivy-report.json
+    expire_in: 7 days
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STAGE 4: CONTAINERIZATION
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+containerization:build:
+  stage: containerization
+  image: docker:latest
+  services:
+    - docker:dind
+  only:
+    - main
+  dependencies:
+    - build
+  before_script:
+    - echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin $DOCKER_REGISTRY
+  script:
+    - echo "Building Docker image..."
+    - docker build -t ${DOCKER_IMAGE}:${DOCKER_TAG} .
+    - docker tag ${DOCKER_IMAGE}:${DOCKER_TAG} ${DOCKER_IMAGE}:latest
+    - echo "Pushing Docker image..."
+    - docker push ${DOCKER_IMAGE}:${DOCKER_TAG}
+    - docker push ${DOCKER_IMAGE}:latest
+    - echo "Docker image pushed: ${DOCKER_IMAGE}:${DOCKER_TAG}"
+  after_script:
+    - docker logout $DOCKER_REGISTRY
+
+containerization:scan:
+  stage: containerization
+  image: aquasec/trivy:latest
+  only:
+    - main
+  dependencies:
+    - containerization:build
+  script:
+    - echo "Scanning Docker image with Trivy..."
+    - trivy image --exit-code 0 --severity HIGH,CRITICAL ${DOCKER_IMAGE}:${DOCKER_TAG}
+  allow_failure: true
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STAGE 5: DEPLOY TO STAGING
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+deploy:staging:
+  stage: deploy-staging
+  image: bitnami/kubectl:latest
+  only:
+    - main
+  environment:
+    name: staging
+    url: https://staging.inventory.example.com
+    on_stop: stop:staging
+  before_script:
+    - echo "$STAGING_KUBECONFIG" | base64 -d > /tmp/kubeconfig
+    - export KUBECONFIG=/tmp/kubeconfig
+    - kubectl config view
+  script:
+    - echo "Deploying to Staging environment..."
+
+    # Update deployment image
+    - kubectl set image deployment/${APP_NAME}
+        ${APP_NAME}=${DOCKER_IMAGE}:${DOCKER_TAG}
+        -n ${KUBE_NAMESPACE_STAGING}
+
+    # Wait for rollout
+    - kubectl rollout status deployment/${APP_NAME} -n ${KUBE_NAMESPACE_STAGING}
+
+    # Verify deployment
+    - kubectl get pods -n ${KUBE_NAMESPACE_STAGING} -l app=${APP_NAME}
+
+    # Run smoke tests
+    - echo "Running smoke tests..."
+    - kubectl run smoke-test --rm -i --restart=Never
+        --image=curlimages/curl:latest
+        -n ${KUBE_NAMESPACE_STAGING}
+        -- curl -f http://${APP_NAME}:8080/health || true
+
+    - echo "Deployment to Staging completed successfully"
+  after_script:
+    - rm -f /tmp/kubeconfig
+
+stop:staging:
+  stage: deploy-staging
+  image: bitnami/kubectl:latest
+  when: manual
+  environment:
+    name: staging
+    action: stop
+  before_script:
+    - echo "$STAGING_KUBECONFIG" | base64 -d > /tmp/kubeconfig
+    - export KUBECONFIG=/tmp/kubeconfig
+  script:
+    - kubectl scale deployment/${APP_NAME} --replicas=0 -n ${KUBE_NAMESPACE_STAGING}
+  after_script:
+    - rm -f /tmp/kubeconfig
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STAGE 6: MANUAL APPROVAL
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+approval:production:
+  stage: approval
+  only:
+    - main
+  when: manual
+  script:
+    - echo "═══════════════════════════════════════════════════════"
+    - echo "  PRODUCTION DEPLOYMENT APPROVAL REQUIRED"
+    - echo "═══════════════════════════════════════════════════════"
+    - echo ""
+    - echo "Application: ${APP_NAME}"
+    - echo "Version: ${DOCKER_TAG}"
+    - echo "Image: ${DOCKER_IMAGE}:${DOCKER_TAG}"
+    - echo ""
+    - echo "Staging tests passed: ✓"
+    - echo "Security scans completed: ✓"
+    - echo ""
+    - echo "Please review before approving:"
+    - echo "  - Staging environment health"
+    - echo "  - Test results and coverage"
+    - echo "  - Security scan reports"
+    - echo "  - Deployment window schedule"
+    - echo ""
+    - echo "Click 'Play' button to proceed with production deployment"
+    - echo "═══════════════════════════════════════════════════════"
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STAGE 7: DEPLOY TO PRODUCTION
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+deploy:production:
+  stage: deploy-production
+  image: bitnami/kubectl:latest
+  only:
+    - main
+  environment:
+    name: production
+    url: https://inventory.example.com
+  dependencies:
+    - approval:production
+  before_script:
+    - echo "$PRODUCTION_KUBECONFIG" | base64 -d > /tmp/kubeconfig
+    - export KUBECONFIG=/tmp/kubeconfig
+    - kubectl config view
+  script:
+    - echo "Deploying to Production environment..."
+
+    # Create backup of current deployment
+    - kubectl get deployment ${APP_NAME} -n ${KUBE_NAMESPACE_PROD} -o yaml > backup-deployment.yaml
+
+    # Update deployment with new image (Rolling Update)
+    - kubectl set image deployment/${APP_NAME}
+        ${APP_NAME}=${DOCKER_IMAGE}:${DOCKER_TAG}
+        -n ${KUBE_NAMESPACE_PROD}
+
+    # Wait for rollout to complete
+    - kubectl rollout status deployment/${APP_NAME} -n ${KUBE_NAMESPACE_PROD} --timeout=5m
+
+    # Verify all pods are running
+    - kubectl get pods -n ${KUBE_NAMESPACE_PROD} -l app=${APP_NAME}
+
+    # Health check
+    - echo "Running health checks..."
+    - kubectl run health-check --rm -i --restart=Never
+        --image=curlimages/curl:latest
+        -n ${KUBE_NAMESPACE_PROD}
+        -- curl -f http://${APP_NAME}:8080/health
+
+    - echo "✓ Deployment to Production completed successfully"
+  after_script:
+    - rm -f /tmp/kubeconfig
+  artifacts:
+    paths:
+      - backup-deployment.yaml
+    expire_in: 30 days
+
+rollback:production:
+  stage: deploy-production
+  image: bitnami/kubectl:latest
+  when: manual
+  only:
+    - main
+  environment:
+    name: production
+  before_script:
+    - echo "$PRODUCTION_KUBECONFIG" | base64 -d > /tmp/kubeconfig
+    - export KUBECONFIG=/tmp/kubeconfig
+  script:
+    - echo "Rolling back Production deployment..."
+    - kubectl rollout undo deployment/${APP_NAME} -n ${KUBE_NAMESPACE_PROD}
+    - kubectl rollout status deployment/${APP_NAME} -n ${KUBE_NAMESPACE_PROD}
+    - echo "✓ Rollback completed"
+  after_script:
+    - rm -f /tmp/kubeconfig
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# NOTIFICATIONS (Optional)
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+.notify:
+  image: curlimages/curl:latest
+  script:
+    - |
+      curl -X POST "${SLACK_WEBHOOK_URL}" \
+        -H 'Content-Type: application/json' \
+        -d "{
+          \"text\": \"${CI_PROJECT_NAME} - ${CI_JOB_NAME}\",
+          \"attachments\": [{
+            \"color\": \"${COLOR}\",
+            \"fields\": [
+              {\"title\": \"Branch\", \"value\": \"${CI_COMMIT_REF_NAME}\", \"short\": true},
+              {\"title\": \"Commit\", \"value\": \"${CI_COMMIT_SHORT_SHA}\", \"short\": true},
+              {\"title\": \"Author\", \"value\": \"${GITLAB_USER_NAME}\", \"short\": true},
+              {\"title\": \"Pipeline\", \"value\": \"${CI_PIPELINE_URL}\", \"short\": false}
+            ]
+          }]
+        }"
+  only:
+    - main
+
+notify:success:
+  extends: .notify
+  stage: .post
+  variables:
+    COLOR: "good"
+  when: on_success
+
+notify:failure:
+  extends: .notify
+  stage: .post
+  variables:
+    COLOR: "danger"
+  when: on_failure

@@ -1,0 +1,108 @@
+---
+# GitLab Runners Role - Main Tasks
+
+- name: Add GitLab Runner repository GPG key
+  apt_key:
+    url: https://packages.gitlab.com/runner/gitlab-runner/gpgkey
+    state: present
+  when: ansible_os_family == "Debian"
+
+- name: Add GitLab Runner repository
+  apt_repository:
+    repo: "deb https://packages.gitlab.com/runner/gitlab-runner/ubuntu/ {{ ansible_distribution_release }} main"
+    state: present
+    filename: gitlab-runner
+  when: ansible_os_family == "Debian"
+
+- name: Install GitLab Runner
+  apt:
+    name: gitlab-runner
+    state: present
+    update_cache: yes
+  when: ansible_os_family == "Debian"
+
+- name: Install Docker (required for Docker executor)
+  block:
+    - name: Install Docker prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install Docker
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Add gitlab-runner user to docker group
+      user:
+        name: gitlab-runner
+        groups: docker
+        append: yes
+
+    - name: Enable and start Docker
+      systemd:
+        name: docker
+        enabled: yes
+        state: started
+
+- name: Create GitLab Runner configuration directory
+  file:
+    path: /etc/gitlab-runner
+    state: directory
+    mode: '0755'
+
+- name: Register GitLab Runners
+  command: >
+    gitlab-runner register
+    --non-interactive
+    --url "{{ gitlab_url }}"
+    --registration-token "{{ gitlab_runner_token }}"
+    --executor "{{ runner_executor }}"
+    --docker-image "{{ runner_docker_image }}"
+    --description "runner-{{ item }}"
+    --tag-list "docker,aws,terraform"
+    --run-untagged="true"
+    --locked="false"
+    --docker-privileged
+    --docker-volumes "/var/run/docker.sock:/var/run/docker.sock"
+    --docker-volumes "/cache"
+  loop: "{{ range(1, gitlab_runner_count + 1) | list }}"
+  register: runner_registration
+  changed_when: "'Runner registered successfully' in runner_registration.stderr"
+  failed_when:
+    - runner_registration.rc != 0
+    - "'already exists' not in runner_registration.stderr"
+
+- name: Enable and start GitLab Runner service
+  systemd:
+    name: gitlab-runner
+    enabled: yes
+    state: started
+
+- name: Verify GitLab Runners
+  command: gitlab-runner verify
+  register: runner_verify
+  changed_when: false
+
+- name: Display runner verification results
+  debug:
+    var: runner_verify.stdout_lines

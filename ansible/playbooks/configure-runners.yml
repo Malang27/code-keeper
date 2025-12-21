@@ -1,0 +1,45 @@
+---
+# Ansible Playbook to Configure GitLab Runners
+# This playbook installs and registers GitLab Runners
+
+- name: Configure GitLab Runners
+  hosts: gitlab_server
+  become: yes
+  gather_facts: yes
+
+  vars:
+    gitlab_runner_count: 3
+    gitlab_runner_token: "{{ lookup('env', 'GITLAB_RUNNER_TOKEN') }}"
+    gitlab_url: "http://{{ ansible_host }}"
+    runner_executor: "docker"
+    runner_docker_image: "alpine:latest"
+
+  pre_tasks:
+    - name: Ensure GitLab Runner token is provided
+      assert:
+        that:
+          - gitlab_runner_token is defined
+          - gitlab_runner_token != ""
+        fail_msg: "GITLAB_RUNNER_TOKEN environment variable must be set"
+
+  roles:
+    - runners
+
+  post_tasks:
+    - name: Verify runners are registered
+      command: gitlab-runner verify
+      register: runner_verify
+      changed_when: false
+
+    - name: Display runners status
+      debug:
+        var: runner_verify.stdout_lines
+
+    - name: List registered runners
+      command: gitlab-runner list
+      register: runner_list
+      changed_when: false
+
+    - name: Display registered runners
+      debug:
+        var: runner_list.stdout_lines

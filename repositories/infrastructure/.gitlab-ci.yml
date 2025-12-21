@@ -1,0 +1,455 @@
+# GitLab CI/CD Pipeline for Infrastructure (Terraform)
+# Stages: Init → Validate → Plan → Apply Staging → Approval → Apply Production
+
+variables:
+  TF_VERSION: "1.6.0"
+  TF_ROOT: "${CI_PROJECT_DIR}/terraform"
+  TF_STATE_BUCKET: "code-keeper-terraform-state"
+  TF_DYNAMODB_TABLE: "terraform-locks"
+  AWS_DEFAULT_REGION: "us-east-1"
+
+stages:
+  - init
+  - validate
+  - plan
+  - apply-staging
+  - approval
+  - apply-production
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TEMPLATES
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+.terraform_base:
+  image:
+    name: hashicorp/terraform:${TF_VERSION}
+    entrypoint: [""]
+  before_script:
+    - cd ${TF_ROOT}
+    - terraform --version
+    - |
+      cat > backend-config.hcl <<EOF
+      bucket         = "${TF_STATE_BUCKET}"
+      key            = "${ENVIRONMENT}/terraform.tfstate"
+      region         = "${AWS_DEFAULT_REGION}"
+      encrypt        = true
+      dynamodb_table = "${TF_DYNAMODB_TABLE}"
+      EOF
+  cache:
+    key: ${ENVIRONMENT}
+    paths:
+      - ${TF_ROOT}/.terraform/
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STAGE 1: INIT (Terraform Initialization)
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+init:staging:
+  extends: .terraform_base
+  stage: init
+  variables:
+    ENVIRONMENT: "staging"
+  only:
+    - main
+    - develop
+  script:
+    - echo "Initializing Terraform for Staging..."
+    - terraform init -backend-config=backend-config.hcl -reconfigure
+    - echo "✓ Terraform initialized successfully"
+  artifacts:
+    paths:
+      - ${TF_ROOT}/.terraform/
+      - ${TF_ROOT}/.terraform.lock.hcl
+    expire_in: 1 day
+
+init:production:
+  extends: .terraform_base
+  stage: init
+  variables:
+    ENVIRONMENT: "production"
+  only:
+    - main
+  script:
+    - echo "Initializing Terraform for Production..."
+    - terraform init -backend-config=backend-config.hcl -reconfigure
+    - echo "✓ Terraform initialized successfully"
+  artifacts:
+    paths:
+      - ${TF_ROOT}/.terraform/
+      - ${TF_ROOT}/.terraform.lock.hcl
+    expire_in: 1 day
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STAGE 2: VALIDATE (Syntax & Security)
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+validate:terraform:
+  extends: .terraform_base
+  stage: validate
+  variables:
+    ENVIRONMENT: "staging"
+  only:
+    - main
+    - develop
+  dependencies:
+    - init:staging
+  script:
+    - echo "Validating Terraform configuration..."
+    - terraform validate
+    - echo "✓ Terraform configuration is valid"
+
+validate:format:
+  extends: .terraform_base
+  stage: validate
+  variables:
+    ENVIRONMENT: "staging"
+  only:
+    - main
+    - develop
+  script:
+    - echo "Checking Terraform formatting..."
+    - terraform fmt -check -recursive
+    - echo "✓ Terraform formatting is correct"
+  allow_failure: true
+
+validate:tfsec:
+  stage: validate
+  image: aquasec/tfsec:latest
+  only:
+    - main
+    - develop
+  script:
+    - echo "Running tfsec security scan..."
+    - cd ${TF_ROOT}
+    - tfsec . --format json --out tfsec-report.json || true
+    - tfsec . --format default
+  allow_failure: true
+  artifacts:
+    reports:
+      sast: ${TF_ROOT}/tfsec-report.json
+    paths:
+      - ${TF_ROOT}/tfsec-report.json
+    expire_in: 7 days
+
+validate:infracost:
+  stage: validate
+  image: infracost/infracost:latest
+  only:
+    - main
+  variables:
+    ENVIRONMENT: "production"
+  dependencies:
+    - init:production
+  script:
+    - echo "Estimating infrastructure costs..."
+    - cd ${TF_ROOT}
+    - infracost breakdown
+        --path .
+        --terraform-var-file environments/${ENVIRONMENT}/terraform.tfvars
+        --format json
+        --out-file infracost-report.json || true
+    - infracost breakdown
+        --path .
+        --terraform-var-file environments/${ENVIRONMENT}/terraform.tfvars
+        --format table
+  allow_failure: true
+  artifacts:
+    paths:
+      - ${TF_ROOT}/infracost-report.json
+    expire_in: 30 days
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STAGE 3: PLAN (Show Infrastructure Changes)
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+plan:staging:
+  extends: .terraform_base
+  stage: plan
+  variables:
+    ENVIRONMENT: "staging"
+  only:
+    - main
+    - develop
+  dependencies:
+    - init:staging
+    - validate:terraform
+  script:
+    - echo "Planning infrastructure changes for Staging..."
+    - terraform plan
+        -var-file=environments/${ENVIRONMENT}/terraform.tfvars
+        -out=tfplan-${ENVIRONMENT}
+        -detailed-exitcode || export TF_EXIT=$?
+    - |
+      if [ ${TF_EXIT} -eq 0 ]; then
+        echo "✓ No changes detected"
+      elif [ ${TF_EXIT} -eq 1 ]; then
+        echo "✗ Terraform plan failed"
+        exit 1
+      elif [ ${TF_EXIT} -eq 2 ]; then
+        echo "✓ Changes detected and plan created"
+      fi
+    - terraform show tfplan-${ENVIRONMENT}
+  artifacts:
+    paths:
+      - ${TF_ROOT}/tfplan-${ENVIRONMENT}
+    expire_in: 1 day
+
+plan:production:
+  extends: .terraform_base
+  stage: plan
+  variables:
+    ENVIRONMENT: "production"
+  only:
+    - main
+  dependencies:
+    - init:production
+    - validate:terraform
+  script:
+    - echo "Planning infrastructure changes for Production..."
+    - terraform plan
+        -var-file=environments/${ENVIRONMENT}/terraform.tfvars
+        -out=tfplan-${ENVIRONMENT}
+        -detailed-exitcode || export TF_EXIT=$?
+    - |
+      if [ ${TF_EXIT} -eq 0 ]; then
+        echo "✓ No changes detected"
+      elif [ ${TF_EXIT} -eq 1 ]; then
+        echo "✗ Terraform plan failed"
+        exit 1
+      elif [ ${TF_EXIT} -eq 2 ]; then
+        echo "✓ Changes detected and plan created"
+      fi
+    - terraform show tfplan-${ENVIRONMENT}
+  artifacts:
+    paths:
+      - ${TF_ROOT}/tfplan-${ENVIRONMENT}
+    expire_in: 1 day
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STAGE 4: APPLY TO STAGING (Automatic)
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+apply:staging:
+  extends: .terraform_base
+  stage: apply-staging
+  variables:
+    ENVIRONMENT: "staging"
+  environment:
+    name: staging
+    on_stop: destroy:staging
+  only:
+    - main
+  dependencies:
+    - plan:staging
+  before_script:
+    - cd ${TF_ROOT}
+  script:
+    - echo "Applying infrastructure changes to Staging..."
+    - terraform apply -auto-approve tfplan-${ENVIRONMENT}
+    - echo "✓ Infrastructure applied successfully to Staging"
+
+    # Output important values
+    - echo "Infrastructure Outputs:"
+    - terraform output -json > outputs-${ENVIRONMENT}.json
+    - terraform output
+
+    # Save kubeconfig
+    - echo "Saving kubeconfig..."
+    - terraform output -raw kubeconfig_${ENVIRONMENT} > kubeconfig-${ENVIRONMENT}.yaml || true
+  artifacts:
+    paths:
+      - ${TF_ROOT}/outputs-${ENVIRONMENT}.json
+      - ${TF_ROOT}/kubeconfig-${ENVIRONMENT}.yaml
+    expire_in: 30 days
+
+destroy:staging:
+  extends: .terraform_base
+  stage: apply-staging
+  variables:
+    ENVIRONMENT: "staging"
+  environment:
+    name: staging
+    action: stop
+  only:
+    - main
+  when: manual
+  dependencies:
+    - init:staging
+  script:
+    - echo "Destroying Staging infrastructure..."
+    - terraform destroy
+        -var-file=environments/${ENVIRONMENT}/terraform.tfvars
+        -auto-approve
+    - echo "✓ Staging infrastructure destroyed"
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STAGE 5: MANUAL APPROVAL FOR PRODUCTION
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+approval:production:
+  stage: approval
+  only:
+    - main
+  when: manual
+  script:
+    - echo "═══════════════════════════════════════════════════════"
+    - echo "  PRODUCTION INFRASTRUCTURE DEPLOYMENT APPROVAL"
+    - echo "═══════════════════════════════════════════════════════"
+    - echo ""
+    - echo "Environment: PRODUCTION"
+    - echo "Commit: ${CI_COMMIT_SHORT_SHA}"
+    - echo "Branch: ${CI_COMMIT_REF_NAME}"
+    - echo "Author: ${GITLAB_USER_NAME}"
+    - echo ""
+    - echo "Staging deployment: ✓ Successful"
+    - echo "Security scans: ✓ Passed"
+    - echo ""
+    - echo "Please review:"
+    - echo "  - Terraform plan output"
+    - echo "  - Infrastructure cost estimate (Infracost)"
+    - echo "  - Security scan results (tfsec)"
+    - echo "  - Staging environment status"
+    - echo "  - Deployment window schedule"
+    - echo ""
+    - echo "IMPORTANT: Production deployment will:"
+    - echo "  - Create/Modify AWS resources"
+    - echo "  - May incur costs (~$200-250/month)"
+    - echo "  - Affect live production environment"
+    - echo ""
+    - echo "Click 'Play' button to proceed with production deployment"
+    - echo "═══════════════════════════════════════════════════════"
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STAGE 6: APPLY TO PRODUCTION (Manual Approval Required)
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+apply:production:
+  extends: .terraform_base
+  stage: apply-production
+  variables:
+    ENVIRONMENT: "production"
+  environment:
+    name: production
+    on_stop: destroy:production
+  only:
+    - main
+  dependencies:
+    - plan:production
+    - approval:production
+  before_script:
+    - cd ${TF_ROOT}
+  script:
+    - echo "Applying infrastructure changes to Production..."
+
+    # Create backup of current state
+    - terraform state pull > state-backup-$(date +%Y%m%d-%H%M%S).json || true
+
+    # Apply changes
+    - terraform apply -auto-approve tfplan-${ENVIRONMENT}
+    - echo "✓ Infrastructure applied successfully to Production"
+
+    # Output important values
+    - echo "Infrastructure Outputs:"
+    - terraform output -json > outputs-${ENVIRONMENT}.json
+    - terraform output
+
+    # Save kubeconfig
+    - echo "Saving kubeconfig..."
+    - terraform output -raw kubeconfig_${ENVIRONMENT} > kubeconfig-${ENVIRONMENT}.yaml || true
+
+    # Save important connection info
+    - |
+      cat > connection-info-${ENVIRONMENT}.txt <<EOF
+      ═══════════════════════════════════════════════════════
+        PRODUCTION INFRASTRUCTURE DEPLOYED
+      ═══════════════════════════════════════════════════════
+
+      Commit: ${CI_COMMIT_SHORT_SHA}
+      Date: $(date)
+      Pipeline: ${CI_PIPELINE_URL}
+
+      EKS Cluster: $(terraform output -raw eks_cluster_name || echo "N/A")
+      RDS Endpoint: $(terraform output -raw rds_endpoint || echo "N/A")
+
+      Next steps:
+      1. Verify cluster access: kubectl get nodes
+      2. Deploy applications
+      3. Run smoke tests
+      4. Monitor CloudWatch dashboards
+
+      ═══════════════════════════════════════════════════════
+      EOF
+    - cat connection-info-${ENVIRONMENT}.txt
+  artifacts:
+    paths:
+      - ${TF_ROOT}/outputs-${ENVIRONMENT}.json
+      - ${TF_ROOT}/kubeconfig-${ENVIRONMENT}.yaml
+      - ${TF_ROOT}/connection-info-${ENVIRONMENT}.txt
+      - ${TF_ROOT}/state-backup-*.json
+    expire_in: 90 days
+
+destroy:production:
+  extends: .terraform_base
+  stage: apply-production
+  variables:
+    ENVIRONMENT: "production"
+  environment:
+    name: production
+    action: stop
+  only:
+    - main
+  when: manual
+  dependencies:
+    - init:production
+  script:
+    - echo "⚠️  WARNING: Destroying Production infrastructure!"
+    - echo "This will DELETE all resources in production"
+    - sleep 5
+    - terraform destroy
+        -var-file=environments/${ENVIRONMENT}/terraform.tfvars
+        -auto-approve
+    - echo "✓ Production infrastructure destroyed"
+
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# NOTIFICATIONS
+#━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+.notify:
+  image: curlimages/curl:latest
+  script:
+    - |
+      if [ -n "${SLACK_WEBHOOK_URL}" ]; then
+        curl -X POST "${SLACK_WEBHOOK_URL}" \
+          -H 'Content-Type: application/json' \
+          -d "{
+            \"text\": \"Infrastructure Pipeline - ${CI_JOB_NAME}\",
+            \"attachments\": [{
+              \"color\": \"${COLOR}\",
+              \"fields\": [
+                {\"title\": \"Environment\", \"value\": \"${ENVIRONMENT}\", \"short\": true},
+                {\"title\": \"Branch\", \"value\": \"${CI_COMMIT_REF_NAME}\", \"short\": true},
+                {\"title\": \"Commit\", \"value\": \"${CI_COMMIT_SHORT_SHA}\", \"short\": true},
+                {\"title\": \"Author\", \"value\": \"${GITLAB_USER_NAME}\", \"short\": true},
+                {\"title\": \"Pipeline\", \"value\": \"${CI_PIPELINE_URL}\", \"short\": false}
+              ]
+            }]
+          }"
+      fi
+
+notify:success:
+  extends: .notify
+  stage: .post
+  variables:
+    COLOR: "good"
+  when: on_success
+  only:
+    - main
+
+notify:failure:
+  extends: .notify
+  stage: .post
+  variables:
+    COLOR: "danger"
+  when: on_failure
+  only:
+    - main

@@ -1,0 +1,18 @@
+---
+# GitLab Role - Handlers
+
+- name: reconfigure gitlab
+  command: gitlab-ctl reconfigure
+  changed_when: false
+
+- name: restart gitlab
+  command: gitlab-ctl restart
+  changed_when: false
+
+- name: stop gitlab
+  command: gitlab-ctl stop
+  changed_when: false
+
+- name: start gitlab
+  command: gitlab-ctl start
+  changed_when: false
